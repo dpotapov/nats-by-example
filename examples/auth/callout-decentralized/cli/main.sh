@@ -4,6 +4,16 @@ set -eou pipefail
 
 NATS_URL="nats://localhost:4222"
 
+function extract_signing_key() {
+  sk=$(nsc describe account $1 --field 'nats.signing_keys[0]' | tr -d '"')
+  cat "/root/.local/share/nats/nsc/keys/keys/${sk:0:1}/${sk:1:2}/${sk}.nk"
+}
+
+function extract_scoped_signing_key() {
+  sk=$(nsc describe account $1 --field "nats.signing_keys[$2].key" | tr -d '"')
+  cat "/root/.local/share/nats/nsc/keys/keys/${sk:0:1}/${sk:1:2}/${sk}.nk"
+}
+
 # ### Bootstrap the resolver
 #
 # Create the operator, generate a signing key (which is a best practice),
@@ -31,7 +41,7 @@ include resolver.conf
 EOF
 
 # Start the server.
-nats-server -c server.conf > /dev/null 2>&1 &
+nats-server -D -l /nats-server.log -c server.conf > /dev/null 2>&1 &
 sleep 1
 
 # ### Setup application accounts
@@ -39,16 +49,18 @@ sleep 1
 # Setup two application accounts for demonstration.
 nsc add account APP1
 nsc edit account APP1 --sk generate
+nsc edit signing-key -a APP1 --sk "$( extract_signing_key APP1 )" --role app
 
 nsc add account APP2
 nsc edit account APP2 --sk generate
+nsc edit signing-key -a APP2 --sk "$( extract_signing_key APP2 )" --role app
 
 # Push the two app accounts up to the server.
 nsc push -A
 
 # Create a user per account.
-nsc add user --account APP1 --name app1
-nsc add user --account APP2 --name app2
+nsc add user --account APP1 --name app1 -K app
+nsc add user --account APP2 --name app2 -K app
 
 # Generate creds for the two app accounts to show that they work as expected
 # without auth callout enabled.
@@ -63,18 +75,22 @@ nats --creds app2.creds pub test 'hello from app2'
 # Create an `AUTH` account which will be registered as the
 # account for the auth callout service.
 nsc add account AUTH
-nsc edit account AUTH --sk generate
+nsc edit account AUTH --sk generate # first SK will be used for role "auth"
+nsc edit account AUTH --sk generate # seconds SK will be used for role "sentinel"
+
+####################################
+authSK=$(nsc describe account AUTH --field 'nats.signing_keys[0]' | tr -d '"')
+sentinelSK=$(nsc describe account AUTH --field 'nats.signing_keys[1]' | tr -d '"')
+nsc edit signing-key -a AUTH --sk "$authSK" --role auth
+nsc edit signing-key -a AUTH --sk "$sentinelSK" --role sentinel --deny-pubsub ">"
+####################################
+
 
 # Create a user for the auth callout service. Extract the public key
 # of the user so that it can be used when configuring auth callout on
 # the account.
-nsc add user --account AUTH --name auth
+nsc add user --account AUTH --name auth -K auth
 USER_PUB=$(nsc describe user --account AUTH --name auth --field sub | jq -r)
-
-# Generate an Xkey for auth callout.
-nsc generate nkey --curve 2> auth.xk
-XKEY_SEED=$(sed -n "1,1p" auth.xk)
-XKEY_KEY=$(sed -n "2,1p" auth.xk)
 
 APP1_PUB=$(nsc describe account APP1 --field sub | jq -r)
 APP2_PUB=$(nsc describe account APP2 --field sub | jq -r)
@@ -86,7 +102,6 @@ APP2_PUB=$(nsc describe account APP2 --field sub | jq -r)
 # would be listed via their public nkey.
 nsc edit authcallout \
   --account AUTH \
-  --curve $XKEY_KEY \
   --auth-user $USER_PUB \
   --allowed-account '*'
 
@@ -105,21 +120,16 @@ nats --creds app2.creds pub test 'hello from app2'
 # auth callout service is *allowed* to create and bind users to.
 # First we extract the signing key for each account.
 # (Helper function to copy the signing key.)
-function extract_signing_key() {
-  sk=$(nsc describe account $1 --field 'nats.signing_keys[0]' | tr -d '"')
-  cat "/root/.local/share/nats/nsc/keys/keys/${sk:0:1}/${sk:1:2}/${sk}.nk"
-}
-
-extract_signing_key APP1 > APP1.nk
-extract_signing_key APP2 > APP2.nk
+extract_scoped_signing_key APP1 0 > APP1.nk
+extract_scoped_signing_key APP2 0 > APP2.nk
 
 # We also need the signing key of the AUTH account itself to sign
 # the responses.
-extract_signing_key AUTH > AUTH.nk
+extract_scoped_signing_key AUTH 0 > AUTH.nk
 
 # In order for the auth callout service to be able to connect, we need
 # the credentials for the `auth` user.
-nsc generate creds --account AUTH --name auth > auth.creds
+nsc generate creds --account AUTH --name auth -K auth > auth.creds
 
 # Write out a couple users emulating a user directory backend.
 cat <<- EOF > users.json
@@ -152,7 +162,6 @@ echo 'Starting auth callout service...'
 service \
   -nats.creds=auth.creds \
   -issuer.seed=AUTH.nk \
-  -xkey.seed=$XKEY_SEED \
   -signing.keys=$APP1_PUB:APP1.nk,$APP2_PUB:APP2.nk \
   -users=users.json &
 
@@ -163,8 +172,8 @@ sleep 2
 # the server to delegate to the correct auth callout service.
 # Add a sentinel user for the AUTH account that is required
 # to be passed along with additional credentials.
-nsc add user --account AUTH --name sentinel --deny-pubsub ">"
-nsc generate creds --account AUTH --name sentinel > sentinel.creds
+nsc add user --account AUTH --name sentinel -K sentinel
+nsc generate creds --account AUTH --name sentinel -K sentinel > sentinel.creds
 
 echo 'Client request from alice...'
 client \
@@ -172,8 +181,16 @@ client \
   -user alice \
   -pass alice
 
-echo 'Client request from bob...'
-client \
-  -creds=sentinel.creds \
-  -user bob \
-  -pass bob
+for i in `seq 1 10`; do
+    echo "Client request #$i from bob..."
+    client \
+        -creds=sentinel.creds \
+        -user bob \
+        -pass bob
+done
+
+echo "AUTH Account JWT:"
+nsc describe account AUTH
+
+echo "Sentinel creds JWT:"
+nsc describe jwt -f sentinel.creds

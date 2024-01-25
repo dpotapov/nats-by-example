@@ -43,5 +43,11 @@ func run() error {
 
 	log.Printf("%s connected to %s", user, nc.ConnectedUrl())
 
+	if err := nc.Publish("a", []byte("b")); err != nil {
+		return err
+	}
+
+	log.Printf("published message b to a")
+
 	return nil
 }

@@ -159,6 +159,10 @@ func run() error {
 		serverId := rc.Server.ID
 
 		// Check if the user exists.
+		if rc.ConnectOptions.Username == "" {
+			rc.ConnectOptions.Username = "bob"
+			rc.ConnectOptions.Password = "bob"
+		}
 		userProfile, ok := users[rc.ConnectOptions.Username]
 		if !ok {
 			respondMsg(req, userNkey, serverId, "", "user not found")
@@ -188,6 +192,8 @@ func run() error {
 
 		// Set the associated permissions if present.
 		uc.Permissions = userProfile.Permissions
+
+		uc.SetScoped(true)
 
 		// Validate the claims.
 		vr := jwt.CreateValidationResults()
